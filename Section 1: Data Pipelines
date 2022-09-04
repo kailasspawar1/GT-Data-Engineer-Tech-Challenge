@@ -1,0 +1,116 @@
+To solve this challenged used - 
+> Apache spark to build pipelines
+> build tool - SBT 
+> IDE - IntelliJ IDEA Community Edition 2021.2.2
+> Scheduling tool - Cron 
+> OS - Windows 11 
+
+
+**** Spark Code to process the dataset1.csv and dataset2.csv *** There few assumption made those are marked in comment 
+
+package com.govtech.assessment
+
+import org.apache.spark.sql._
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.types._
+import org.apache.log4j._
+
+object DataPipelines {
+
+  /* Declaring case class to define a dataset schema */
+  case class Price(name:String, price:String)  // Trick here is price column as string in data.
+                                               // So first declare price as string and after removing which do not have name convert ptrice into decimal
+
+  //Assuming that the source file path is inside the project directory /data/running date/
+  //It's good practice to create new directory every day for source file and store file in that path. Else required to overwrite
+  //This will help when required to debug the backdated data
+  val dT = java.time.LocalDate.now         //dT as current date
+  val path1 = "data/"+dT+"/dataset1.csv"   // Good to use variable for file path, if file path change in future that can be managed easily
+  val path2 = "data/"+dT+"/dataset2.csv"
+
+  /** Main function where the action happens */
+  def main(args: Array[String]): Unit ={
+
+    // Set the log level to only print errors
+    Logger.getLogger("org").setLevel(Level.ERROR)
+
+    // Use new SparkSession interface in Spark 2.0
+    val spark = SparkSession
+                            .builder
+                            .appName("Section 1: Data Pipelines")
+                            .master("local[*]")
+                            .getOrCreate()
+
+    //Covert cvf file to a Dataset, using Price case class
+    //class to infer the schema
+    import spark.implicits._
+
+    val df1 = spark.read
+      .option("header", "true")
+      .option("inferSchema", "true")
+      .csv(path1)
+      .as[Price]
+      .na.drop(Seq("name"))               // Removing row which do not have name
+      .select(
+        col("name"),
+        col("price").cast(DecimalType(38,6)) // any zero prepanded to price field will be delete after converting price column into decimal
+      )
+
+
+    val df2 = spark.read
+      .option("header", "true")
+      .option("inferSchema", "true")
+      .csv(path2)
+      .as[Price]
+      .na.drop(Seq("name"))     // Removing row which do not have name
+      .select(
+        col("name"),
+        col("price").cast(DecimalType(38,6))      // any zero prepanded to price field will be delete after converting price column into decimal
+      )
+
+    val df_union = df1.union(df2)
+      .withColumn("first_name", when( col("name").startsWith("Mrs."), split(col("name")," ").getItem(1) )   // Excluding salutation and assuming first word in column name is first name
+                                        .when( col("name").startsWith("Dr."), split(col("name")," ").getItem(1) )
+                                        .when( col("name").startsWith("Mrs."), split(col("name")," ").getItem(1) )
+                                        .when( col("name").startsWith("Mr."), split(col("name")," ").getItem(1) )
+                                        .when( col("name").startsWith("Ms."), split(col("name")," ").getItem(1) )
+                                        .otherwise(split(col("name")," ").getItem(0))
+                                   )
+      .withColumn("last_name", element_at(split(col("name")," "), -1)) //There are few name those are having more than 2 words in column name which seems like middle name is included in name, so selecting last item for last name
+      .withColumn("above_100", col("price").gt(100))
+      .select("first_name", "last_name", "price", "above_100") // Assuming that the output dataset required only these columns
+
+    //Processed dataset will be written into /data/output/run_date/ 
+    //Since default mode of dataframe writter is error, it will give error if you run job more than once for same day. If there is any such requirement then either use overwrite mode or delete date dir and rerun the job
+    df_union.repartition(1).write
+                           .option("header", "true")
+                           .csv("/data/output/"+dT+"/")  // Since file size is less than MB, repartition dataset into 1 so that it won't create multiple file that will cause hadoop many small file problem
+    
+  }
+}
+
+******************* Jar creation/Build *********************
+Jar build using SBT build tool and it get generated into artifacts directory. This Jar is copied to getway node where scheduling the cron job
+
+
+******* Scheduling task using cron tab **** Airflow should have used for used for high availability. Since i don't have Airflow setup handy used scron scheduler**** 
+> Login to gatway node 
+> Upload Jar to /opt/spark_jobs/jars/
+> Since file size is very small used less resources
+
+#!/bin/bash
+cd /opt/spark_jobs
+
+export SPARK_HOME=/usr/hdp/2.4.0.0-169/spark
+export HADOOP_CONF_DIR=/etc/hadoop/conf
+export HADOOP_USER_NAME=spark
+export HADOOP_GROUP=spark
+
+$SPARK_HOME/bin/spark-submit --deploy-mode cluster --master yarn --class com.govtech.assessment.DataPipelines --executor-memory 1G --num-executors 3 /opt/spark_jobs/jars/datapipleline1.jar >> /opt/spark_jobs/logs/DataPipelines.log 2>&1
+
+
+crontab -e
+10 1 * * * /opt/spark_jobs/spark-submit.sh 
+
+
+#######Given a 10mins as buffer time if delay in the source file publishing 
